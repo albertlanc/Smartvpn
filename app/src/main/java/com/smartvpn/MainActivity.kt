@@ -7,24 +7,28 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.smartvpn.ui.profiles.AddProfileScreen
+import com.smartvpn.ui.profiles.MainScreen
 import com.smartvpn.vpn.SmartVpnService
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
-    // Launcher to request VPN permission from the Android OS
+    private var pendingProfileId: Int? = null
+
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            startSmartVpn()
+        if (result.resultCode == RESULT_OK && pendingProfileId != null) {
+            startSmartVpn(pendingProfileId!!)
         } else {
             Toast.makeText(this, "VPN Permission Denied", Toast.LENGTH_SHORT).show()
         }
@@ -39,30 +43,43 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen(
-                        onConnectClick = { checkAndStartVpn() },
-                        onDisconnectClick = { stopSmartVpn() }
-                    )
+                    val navController = rememberNavController()
+
+                    NavHost(navController = navController, startDestination = "main") {
+                        composable("main") {
+                            MainScreen(
+                                onNavigateToAddProfile = { navController.navigate("add_profile") },
+                                onConnectClick = { profileId -> 
+                                    checkAndStartVpn(profileId) 
+                                },
+                                onDisconnectClick = { stopSmartVpn() }
+                            )
+                        }
+                        composable("add_profile") {
+                            AddProfileScreen(
+                                onNavigateBack = { navController.popBackStack() }
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 
-    private fun checkAndStartVpn() {
-        // VpnService.prepare() returns an Intent if permission is needed, null if already granted
+    private fun checkAndStartVpn(profileId: Int) {
+        pendingProfileId = profileId
         val intent = VpnService.prepare(this)
         if (intent != null) {
             vpnPermissionLauncher.launch(intent)
         } else {
-            startSmartVpn()
+            startSmartVpn(profileId)
         }
     }
 
-    private fun startSmartVpn() {
+    private fun startSmartVpn(profileId: Int) {
         val serviceIntent = Intent(this, SmartVpnService::class.java).apply {
             action = SmartVpnService.ACTION_START_VPN
-            // Dummy config for testing the service start
-            putExtra("CONFIG_JSON", "{}") 
+            putExtra(SmartVpnService.EXTRA_PROFILE_ID, profileId)
             putExtra("BYPASS_LAN", true)
         }
         startService(serviceIntent)
@@ -73,28 +90,5 @@ class MainActivity : ComponentActivity() {
             action = SmartVpnService.ACTION_STOP_VPN
         }
         startService(serviceIntent)
-    }
-}
-
-@Composable
-fun MainScreen(onConnectClick: () -> Unit, onDisconnectClick: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(text = "Smart VPN", style = MaterialTheme.typography.headlineLarge)
-        
-        Spacer(modifier = Modifier.height(32.dp))
-        
-        Button(onClick = onConnectClick, modifier = Modifier.fillMaxWidth(0.6f)) {
-            Text("Connect")
-        }
-        
-        Spacer(modifier = Modifier.height(16.dp))
-        
-        OutlinedButton(onClick = onDisconnectClick, modifier = Modifier.fillMaxWidth(0.6f)) {
-            Text("Disconnect")
-        }
     }
 }
