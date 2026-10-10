@@ -1,21 +1,29 @@
 package com.smartvpn.vpn
 
-import android.app.Notification
 import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.smartvpn.MainActivity
 import com.smartvpn.SmartVpnApp
+import com.smartvpn.core.SingboxWrapper
+import com.smartvpn.data.local.VpnProfileDao
+import com.smartvpn.utils.EngineConfigBuilder
+import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import javax.inject.Inject
 
+@AndroidEntryPoint
 class SmartVpnService : VpnService() {
+
+    @Inject
+    lateinit var vpnProfileDao: VpnProfileDao
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -23,21 +31,33 @@ class SmartVpnService : VpnService() {
     companion object {
         const val ACTION_START_VPN = "com.smartvpn.START_VPN"
         const val ACTION_STOP_VPN = "com.smartvpn.STOP_VPN"
+        const val EXTRA_PROFILE_ID = "profile_id"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START_VPN -> {
-                val configJson = intent.getStringExtra("CONFIG_JSON") ?: ""
+                val profileId = intent.getIntExtra(EXTRA_PROFILE_ID, -1)
                 val allowedApps = intent.getStringArrayListExtra("ALLOWED_APPS") ?: arrayListOf()
                 val bypassLan = intent.getBooleanExtra("BYPASS_LAN", true)
-                
-                startForegroundService()
-                startVpnConnection(configJson, allowedApps, bypassLan)
+
+                if (profileId != -1) {
+                    startForegroundService()
+                    serviceScope.launch {
+                        val profile = vpnProfileDao.getProfileById(profileId)
+                        if (profile != null) {
+                            startVpnConnection(profile, allowedApps, bypassLan)
+                        } else {
+                            Log.e("SmartVpn", "Profile not found for ID: $profileId")
+                            stopVpnConnection()
+                        }
+                    }
+                } else {
+                    Log.e("SmartVpn", "No profile ID provided")
+                    stopSelf()
+                }
             }
-            ACTION_STOP_VPN -> {
-                stopVpnConnection()
-            }
+            ACTION_STOP_VPN -> stopVpnConnection()
         }
         return START_STICKY
     }
@@ -50,8 +70,8 @@ class SmartVpnService : VpnService() {
 
         val notification = NotificationCompat.Builder(this, SmartVpnApp.VPN_CHANNEL_ID)
             .setContentTitle("Smart VPN is active")
-            .setContentText("Securing your network traffic")
-            .setSmallIcon(android.R.drawable.ic_secure) // Placeholder icon
+            .setContentText("Securing your connection")
+            .setSmallIcon(android.R.drawable.ic_secure)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
@@ -59,34 +79,28 @@ class SmartVpnService : VpnService() {
         startForeground(1, notification)
     }
 
-    private fun startVpnConnection(configJson: String, allowedApps: List<String>, bypassLan: Boolean) {
+    private suspend fun startVpnConnection(
+        profile: com.smartvpn.data.local.VpnProfile,
+        allowedApps: List<String>,
+        bypassLan: Boolean
+    ) {
         try {
             val builder = Builder()
-                .setSession("Smart VPN")
+                .setSession("Smart VPN - ${profile.name}")
                 .setMtu(1500)
                 .addAddress("172.19.0.1", 30)
-                // Default fallback IPv6 (Can be toggled via settings later)
-                .addAddress("fdfe:dcba:9876::1", 126)
 
-            // DNS Management
             builder.addDnsServer("1.1.1.1")
             builder.addDnsServer("1.0.0.1")
 
-            // Network Routing & LAN Bypass
             if (bypassLan) {
                 // Route public IPs, bypass local subnets (192.168.x.x, 10.x.x.x, 172.16.x.x)
-                resources.getStringArray(android.R.array.emailAddressTypes) // Dummy workaround for brevity, real implementation requires exact IP CIDR blocks
                 builder.addRoute("1.0.0.0", 8)
                 builder.addRoute("2.0.0.0", 7)
-                // In production, you will add all public IPv4 blocks here to bypass LAN.
-                // For this foundational step, we route everything if bypassLan is false:
-            } 
-            
-            // Route all traffic
+            }
             builder.addRoute("0.0.0.0", 0)
-            builder.addRoute("::", 0) // Route all IPv6
+            builder.addRoute("::", 0)
 
-            // Split Tunneling (App Filtering)
             if (allowedApps.isNotEmpty()) {
                 for (appPackage in allowedApps) {
                     try {
@@ -97,14 +111,21 @@ class SmartVpnService : VpnService() {
                 }
             }
 
-            // Establish the TUN interface
             vpnInterface = builder.establish()
             val fd = vpnInterface?.fd
 
             if (fd != null) {
                 Log.d("SmartVpn", "VPN Interface established. FD: $fd")
-                // TODO: Pass 'fd' and 'configJson' to the Sing-box/Xray Go engine here.
-                // Example: SingboxWrapper.startEngine(configJson, fd)
+                
+                // Generate the JSON configuration based on the user's profile
+                val configJson = EngineConfigBuilder.buildSingboxConfig(profile, fd)
+                
+                // Start the Go engine with the configuration
+                val success = SingboxWrapper.startEngine(configJson)
+                if (!success) {
+                    Log.e("SmartVpn", "Engine failed to start.")
+                    stopVpnConnection()
+                }
             } else {
                 Log.e("SmartVpn", "Failed to establish VPN interface (FD is null)")
                 stopVpnConnection()
@@ -117,23 +138,22 @@ class SmartVpnService : VpnService() {
     }
 
     private fun stopVpnConnection() {
-        // TODO: Stop the Sing-box/Xray Go engine here.
-        // Example: SingboxWrapper.stopEngine()
-        
-        try {
-            vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e("SmartVpn", "Error closing VPN interface: ${e.message}")
-        } finally {
-            vpnInterface = null
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+        serviceScope.launch {
+            SingboxWrapper.stopEngine()
+            try {
+                vpnInterface?.close()
+            } catch (e: Exception) {
+                Log.e("SmartVpn", "Error closing VPN interface: ${e.message}")
+            } finally {
+                vpnInterface = null
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
     }
 
     override fun onDestroy() {
         serviceScope.cancel()
-        stopVpnConnection()
         super.onDestroy()
     }
 }
